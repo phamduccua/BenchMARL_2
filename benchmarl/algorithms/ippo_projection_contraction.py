@@ -454,5 +454,158 @@ class PCExtraGradientAdam(optim.Optimizer):
             "1. backward()\n"
             "2. extrapolation_step()\n"
             "3. second forward/backward\n"
-            "4. pc_update()\n"
+            "pc_update()\n"
         )
+
+
+# ============================================================
+# Callback
+# ============================================================
+
+from benchmarl.experiment.callback import Callback
+from tensordict import TensorDictBase
+
+class ProjectionContractionCallback(Callback):
+
+    def __init__(self):
+        super().__init__()
+        self.actor_optimizers: Dict[str, PCExtraGradientAdam] = {}
+        self.critic_optimizers: Dict[str, optim.Adam] = {}
+
+    def on_setup(self) -> None:
+        exp = self.experiment
+        algo_cfg = exp.algorithm_config
+
+        for group in exp.group_map.keys():
+            group_opts = exp.optimizers[group]
+
+            # Actor
+            if "loss_objective" in group_opts:
+                old_opt = group_opts["loss_objective"]
+                
+                actor_opt = PCExtraGradientAdam(
+                    params=[{"params": pg["params"]} for pg in old_opt.param_groups],
+                    lr=exp.config.lr,
+                    betas=getattr(algo_cfg, "extra_betas", (0.9, 0.999)),
+                    eps=getattr(exp.config, "adam_eps", 1e-8),
+                    pc_beta=getattr(algo_cfg, "pc_beta", 1.0),
+                    pc_theta=getattr(algo_cfg, "pc_theta", 0.95),
+                    pc_gamma=getattr(algo_cfg, "pc_gamma", 0.1),
+                    viscosity_scale=getattr(algo_cfg, "viscosity_scale", 0.5),
+                    target_tau=getattr(algo_cfg, "target_tau", 0.005),
+                    grad_clip=getattr(algo_cfg, "grad_clip", 10.0),
+                    lambda_min=getattr(algo_cfg, "pc_lambda_min", 1e-6),
+                    lambda_max=getattr(algo_cfg, "pc_lambda_max", 1.0),
+                    beta_min=getattr(algo_cfg, "pc_beta_min", 1e-4),
+                    beta_max=getattr(algo_cfg, "pc_beta_max", 2.0),
+                )
+                group_opts["loss_objective"] = actor_opt
+                self.actor_optimizers[group] = actor_opt
+
+            # Critic
+            if "loss_critic" in group_opts:
+                self.critic_optimizers[group] = group_opts["loss_critic"]
+
+    def on_train_step(self, batch: TensorDictBase, group: str) -> None:
+        exp = self.experiment
+        algo_cfg = exp.algorithm_config
+
+        if group in self.actor_optimizers:
+            actor_opt = self.actor_optimizers[group]
+
+            def _loss_fn(vals):
+                l = vals["loss_objective"]
+                if "loss_entropy" in vals:
+                    l = l + vals["loss_entropy"]
+                return l
+
+            # 1. Extrapolation
+            actor_opt.zero_grad()
+            _loss_fn(exp.losses[group](batch)).backward()
+            actor_opt.extrapolation_step()
+
+            # 2. Update
+            actor_opt.zero_grad()
+            _loss_fn(exp.losses[group](batch)).backward()
+            actor_opt.pc_update()
+            
+            actor_opt.zero_grad()
+
+        # Critic step (Adam)
+        if group in self.critic_optimizers:
+            critic_opt = self.critic_optimizers[group]
+            critic_opt.zero_grad()
+            l_vals = exp.losses[group](batch)
+            if "loss_critic" in l_vals:
+                l_vals["loss_critic"].backward()
+                torch.nn.utils.clip_grad_norm_(
+                    [p for pg in critic_opt.param_groups for p in pg["params"]],
+                    max_norm=getattr(algo_cfg, "grad_clip", 10.0),
+                )
+                critic_opt.step()
+            critic_opt.zero_grad()
+
+        # Logging
+        if group in self.actor_optimizers:
+            actor_opt = self.actor_optimizers[group]
+            if exp.n_iters_performed % 100 == 0:
+                stats = {
+                    f"train/pc/{group}/{k}": v 
+                    for k, v in actor_opt.last_stats.items()
+                }
+                exp.logger.log(stats, step=exp.n_iters_performed)
+
+
+# ============================================================
+# Algorithm & Config
+# ============================================================
+
+from benchmarl.algorithms.ippo_vi import IppoVI, IppoVIConfig
+from dataclasses import dataclass
+
+class IppoPCVI(IppoVI):
+    def __init__(
+        self,
+        extra_betas=(0.9, 0.999),
+        pc_beta=1.0,
+        pc_theta=0.95,
+        pc_gamma=0.1,
+        viscosity_scale=0.5,
+        target_tau=0.005,
+        grad_clip=10.0,
+        pc_lambda_min=1e-6,
+        pc_lambda_max=1.0,
+        pc_beta_min=1e-4,
+        pc_beta_max=2.0,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.extra_betas = extra_betas
+        self.pc_beta = pc_beta
+        self.pc_theta = pc_theta
+        self.pc_gamma = pc_gamma
+        self.viscosity_scale = viscosity_scale
+        self.target_tau = target_tau
+        self.grad_clip = grad_clip
+        self.pc_lambda_min = pc_lambda_min
+        self.pc_lambda_max = pc_lambda_max
+        self.pc_beta_min = pc_beta_min
+        self.pc_beta_max = pc_beta_max
+
+@dataclass
+class IppoPCVIConfig(IppoVIConfig):
+    extra_betas: Tuple[float, float] = (0.9, 0.999)
+    pc_beta: float = 1.0
+    pc_theta: float = 0.95
+    pc_gamma: float = 0.1
+    viscosity_scale: float = 0.5
+    target_tau: float = 0.005
+    grad_clip: float = 10.0
+    pc_lambda_min: float = 1e-6
+    pc_lambda_max: float = 1.0
+    pc_beta_min: float = 1e-4
+    pc_beta_max: float = 2.0
+
+    @staticmethod
+    def associated_class():
+        return IppoPCVI

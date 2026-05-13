@@ -109,7 +109,7 @@ run_algo() {
 
 if [ $# -eq 0 ]; then
     echo "Cách dùng: $0 <algo1> [algo2] ..."
-    echo "Ví dụ:    $0 ippo_vi ippo mappo ippo_projection_contraction ippo_projection_contraction_alg2"
+    echo "Ví dụ:    $0 ippo_vi ippo mappo projection"
     exit 1
 fi
 
@@ -139,12 +139,8 @@ for algo in "$@"; do
         ippo_extragradient_self_adaptive)
             run_algo "ippo_extragradient_self_adaptive" "ippo_extragradient_self_adaptive"
             ;;
-        ippo_projection_contraction)
-            run_algo "ippo_projection_contraction" "ippo_projection_contraction"
-            ;;
-        ippo_projection_contraction_alg2)
-            run_algo "ippo_projection_contraction" "ippo_projection_contraction_alg2" \
-                "algorithm.viscosity_mode=alg2"
+        projection|ippo_projection|ippo_projection_contraction)
+            run_algo "ippo_projection_contraction" "$algo"
             ;;
         *)
             run_algo "$algo" "$algo"
