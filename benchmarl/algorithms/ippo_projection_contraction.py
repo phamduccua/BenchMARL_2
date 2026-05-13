@@ -27,8 +27,8 @@ class PCExtraGradientAdam(optim.Optimizer):
         pc_beta=1.0,
         pc_theta=0.95,
         pc_gamma=0.1,
-        # viscosity
-        viscosity_scale=0.5,
+        # viscosity (nhỏ để tránh kìm hãm learning ban đầu)
+        viscosity_scale=0.01,
         # EMA target
         target_tau=0.005,
         # stability
@@ -59,9 +59,13 @@ class PCExtraGradientAdam(optim.Optimizer):
 
     def viscosity_t(self):
         """
-        Conditions: t_k -> 0, sum t_k = infinity
+        Conditions: t_k -> 0, sum t_k = infinity.
+        Warmup: không áp viscosity trong 200 iterations đầu để tránh kìm hãm learning.
         """
-        return self.viscosity_scale / (self.iteration + 1)
+        warmup = 200
+        if self.iteration < warmup:
+            return 0.0
+        return self.viscosity_scale / (self.iteration - warmup + 1)
 
     def _init_state(self, p):
         state = self.state[p]
@@ -164,10 +168,13 @@ class PCExtraGradientAdam(optim.Optimizer):
 
                 state = self.state[p]
 
+                # FIX 1: Dùng moments ĐÃ CẬP NHẬT (new_m/new_v từ extrapolation_step)
+                # thay vì moments cũ (exp_avg/exp_avg_sq chưa được commit)
+                # để tính F(v_k) chính xác hơn.
                 direction_half, _, _ = self._adam_direction(
                     grads_half[p],
-                    state["exp_avg"],
-                    state["exp_avg_sq"],
+                    state["new_m"],   # ✅ moments mới (đã tích lũy grad tại u_k)
+                    state["new_v"],   # ✅ moments mới
                     state["step"],
                     beta1,
                     beta2,
@@ -235,6 +242,8 @@ class PCExtraGradientAdam(optim.Optimizer):
     def pc_update(self):
         self._collect_pc_geometry()
 
+        # FIX 4: Tính lambda_k trước, áp dụng ngay trong bước update hiện tại
+        # (không phải chờ đến iteration sau mới dùng)
         lambda_k = self._compute_lambda()
         beta_k = self._compute_beta()
         t_k = self.viscosity_t()
@@ -243,12 +252,15 @@ class PCExtraGradientAdam(optim.Optimizer):
             # Khôi phục u_k
             p.data.copy_(state["u_k"])
 
-            # w_k = u_k - β_k d_k
+            # w_k = u_k - β_k d_k  (projection-contraction step)
             w_k = p.data - beta_k * d_k
             target_param = state["target_param"]
 
-            # Algorithm 2 viscosity update
-            u_next = t_k * target_param + (1.0 - t_k) * w_k
+            # Viscosity update: chỉ kéo về anchor khi t_k > 0 (sau warmup)
+            if t_k > 0.0:
+                u_next = t_k * target_param + (1.0 - t_k) * w_k
+            else:
+                u_next = w_k
             p.data.copy_(u_next)
 
             # EMA target update
@@ -262,6 +274,7 @@ class PCExtraGradientAdam(optim.Optimizer):
             for k in ["u_k", "v_k", "F_u_k", "new_m", "new_v"]:
                 state.pop(k, None)
 
+        # Áp dụng lambda_k cho extrapolation step TIẾP THEO (step-size adaptive)
         self.current_lr = lambda_k
         self.iteration += 1
         self.last_stats = {"lambda_k": lambda_k, "beta_k": beta_k, "t_k": t_k}
@@ -328,9 +341,11 @@ class ProjectionContractionCallback(Callback):
                     l = l + vals["loss_entropy"]
                 return l
 
-            # Clone batch để tránh lỗi inplace modification trên TensorDict từ TorchRL module
-            batch_step1 = batch.clone(False)
-            batch_step2 = batch.clone(False)
+            # FIX 3: Deep clone (True) để tránh data corruption do TorchRL
+            # thực hiện in-place ops trên batch khi tính loss.
+            # Shallow clone (False) khiến batch_step2 nhận batch đã bị sửa.
+            batch_step1 = batch.clone(True)
+            batch_step2 = batch.clone(True)
 
             # --- Bước 1: Extrapolation ---
             actor_opt.zero_grad()
@@ -351,8 +366,8 @@ class ProjectionContractionCallback(Callback):
             critic_opt = self.critic_optimizers[group]
             critic_opt.zero_grad()
             
-            # Cần clone nếu actor đã thao tác trên batch gốc
-            batch_critic = batch.clone(False)
+            # FIX 3 (cont): Deep clone cho critic batch
+            batch_critic = batch.clone(True)
             l_vals = exp.losses[group](batch_critic)
             
             if "loss_critic" in l_vals:
@@ -387,7 +402,7 @@ class IppoPCVI(IppoVI):
         pc_beta=1.0,
         pc_theta=0.95,
         pc_gamma=0.1,
-        viscosity_scale=0.5,
+        viscosity_scale=0.01,
         target_tau=0.005,
         grad_clip=10.0,
         pc_lambda_min=1e-6,
@@ -418,7 +433,7 @@ class IppoPCVIConfig(IppoVIConfig):
     pc_beta: float = 1.0
     pc_theta: float = 0.95
     pc_gamma: float = 0.1
-    viscosity_scale: float = 0.5
+    viscosity_scale: float = 0.01
     target_tau: float = 0.005
     grad_clip: float = 10.0
     pc_lambda_min: float = 1e-6
