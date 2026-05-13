@@ -1,0 +1,43 @@
+defaults:
+  - ippo_extragradient_self_adaptive_config
+  - _self_
+
+share_param_critic: False
+clip_epsilon: 0.2
+entropy_coef: 0.0
+critic_coef: 1.0
+loss_critic_type: "l2"
+lmbda: 0.9
+scale_mapping: "biased_softplus_1.0"
+use_tanh_normal: True
+minibatch_advantage: False
+
+# VIOptimizer hyperparameter (inherited from IppoVIConfig)
+vi_tau: 0.1
+
+# Self-Adaptive ExtraGradient hyperparameters
+extra_betas: [0.9, 0.999]
+
+# gamma: scaling factor for tau_k (projection step size)
+extra_gamma: 1.9
+
+# nu: scales param_dist/grad_dist ratio to compute adaptive LR target
+extra_nu: 0.95
+
+# rho: max LR increment per step (additive upper bound)
+extra_rho: 1.0e-4
+
+# min_scale: minimum relative scale for LR (clamp lower bound)
+extra_min_scale: 0.1
+
+# min_lr_scale: absolute LR floor as a fraction of experiment.lr.
+extra_min_lr_scale: 0.1
+
+# tau_max: optional upper clamp for tau_k. Null disables clamping.
+extra_tau_max: 2.0
+
+# rho_decay_power: if > 0, uses rho_k = rho / (k + 1)^rho_decay_power.
+extra_rho_decay_power: 1.1
+
+# extra_log_interval: logs lambda/tau/effective step every N train iterations. 0 disables.
+extra_log_interval: 1

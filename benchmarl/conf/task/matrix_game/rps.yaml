@@ -1,0 +1,5 @@
+defaults:
+  - matrix_game_rps_config
+  - _self_
+
+max_steps: 1

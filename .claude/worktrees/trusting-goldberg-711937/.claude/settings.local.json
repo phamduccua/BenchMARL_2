@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"D:\\\\research\\\\Thuc_nghiem_marl\\\\BenchMARL\\\\.claude\\\\worktrees\\\\trusting-goldberg-711937\" status)",
+      "Bash(cp D:/research/Thuc_nghiem_marl/BenchMARL/.claude/worktrees/trusting-goldberg-711937/benchmarl/algorithms/ippo_extragradient_adaptive.py D:/research/Thuc_nghiem_marl/BenchMARL/benchmarl/algorithms/ippo_extragradient_adaptive.py)",
+      "Bash(cp D:/research/Thuc_nghiem_marl/BenchMARL/.claude/worktrees/trusting-goldberg-711937/benchmarl/conf/algorithm/ippo_extragradient_adaptive.yaml D:/research/Thuc_nghiem_marl/BenchMARL/benchmarl/conf/algorithm/ippo_extragradient_adaptive.yaml)",
+      "Bash(cp D:/research/Thuc_nghiem_marl/BenchMARL/.claude/worktrees/trusting-goldberg-711937/benchmarl/algorithms/__init__.py D:/research/Thuc_nghiem_marl/BenchMARL/benchmarl/algorithms/__init__.py)",
+      "Bash(cp D:/research/Thuc_nghiem_marl/BenchMARL/.claude/worktrees/trusting-goldberg-711937/run_bench.sh D:/research/Thuc_nghiem_marl/BenchMARL/run_bench.sh)",
+      "Read(//d/research/Thuc_nghiem_marl/BenchMARL/benchmarl/algorithms/**)"
+    ]
+  }
+}

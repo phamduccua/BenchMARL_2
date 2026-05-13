@@ -1,0 +1,39 @@
+defaults:
+  - ippo_projection_contraction_config
+  - _self_
+
+share_param_critic: False
+clip_epsilon: 0.2
+entropy_coef: 0.0
+critic_coef: 1.0
+loss_critic_type: "l2"
+lmbda: 0.9
+scale_mapping: "biased_softplus_1.0"
+use_tanh_normal: True
+minibatch_advantage: False
+
+# VIOptimizer hyperparameter (inherited from IppoVIConfig)
+vi_tau: 0.1
+
+# Adam betas for the PC optimizer
+extra_betas: [0.9, 0.999]
+
+# pc_beta: scaling factor for beta_k (projection step numerator weight)
+pc_beta: 1.0
+
+# pc_theta: fraction of param_dist/grad_dist used to update lambda
+pc_theta: 0.95
+
+# pc_lambda_min / pc_lambda_max: clamp bounds for adaptive learning rate
+pc_lambda_min: 1.0e-6
+pc_lambda_max: 1.0
+
+# pc_beta_min / pc_beta_max: clamp bounds for beta_k
+pc_beta_min: 0.05
+pc_beta_max: 2.0
+
+# grad_clip: gradient clipping value applied before extrapolation
+grad_clip: 10.0
+
+# pc_log_interval: log VI stats every N train iterations. 0 disables.
+pc_log_interval: 0
