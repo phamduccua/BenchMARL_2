@@ -394,6 +394,7 @@ class IppoPCVI(IppoVI):
         pc_lambda_max=1.0,
         pc_beta_min=1e-4,
         pc_beta_max=2.0,
+        pc_log_interval=0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -408,6 +409,7 @@ class IppoPCVI(IppoVI):
         self.pc_lambda_max = pc_lambda_max
         self.pc_beta_min = pc_beta_min
         self.pc_beta_max = pc_beta_max
+        self.pc_log_interval = pc_log_interval
 
 
 @dataclass
