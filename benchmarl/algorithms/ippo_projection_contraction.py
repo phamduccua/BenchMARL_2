@@ -67,20 +67,43 @@ class PCExtraGradientAdam(optim.Optimizer):
     # Utilities
     # ============================================================
 
-    def _get_all_params(self) -> List[torch.Tensor]:
-        params = []
+    def _collect_grads(self) -> Dict[torch.Tensor, torch.Tensor]:
+        """
+        Collect detached gradients (+ weight decay) for every parameter
+        that has a gradient.  Returns {p: grad} mapping.
+        """
+        grads: Dict[torch.Tensor, torch.Tensor] = {}
         for group in self.param_groups:
+            wd = group["weight_decay"]
             for p in group["params"]:
-                if p.requires_grad:
-                    params.append(p)
-        return params
+                if p.grad is None:
+                    continue
+                g = p.grad.detach().clone()
+                if wd > 0:
+                    g = g.add(p.data, alpha=wd)
+                grads[p] = g
+        return grads
 
-    def _clip_grad_by_norm(self, grad: torch.Tensor) -> torch.Tensor:
-        """Clip a detached gradient tensor by global norm."""
-        grad_norm = grad.norm()
-        if grad_norm > self.grad_clip:
-            grad = grad * (self.grad_clip / (grad_norm + 1e-8))
-        return grad
+    def _global_clip(
+        self,
+        grads: Dict[torch.Tensor, torch.Tensor],
+    ) -> Dict[torch.Tensor, torch.Tensor]:
+        """
+        True global-norm clipping:
+
+            g  ←  g · c / max(‖g‖_global, c)
+
+        where ‖g‖_global = sqrt( Σ_i ‖g_i‖² ) over ALL parameters.
+        Each tensor is scaled by the SAME scalar, so relative directions
+        are preserved exactly — identical to PyTorch's clip_grad_norm_.
+        """
+        global_norm = torch.sqrt(
+            sum(g.norm() ** 2 for g in grads.values())
+        )
+        clip_coef = self.grad_clip / (global_norm + 1e-6)
+        if clip_coef < 1.0:
+            grads = {p: g * clip_coef for p, g in grads.items()}
+        return grads
 
     # ============================================================
     # Adam preconditioned direction (stateless read)
@@ -135,20 +158,17 @@ class PCExtraGradientAdam(optim.Optimizer):
 
     @torch.no_grad()
     def extrapolation_step(self):
-        for group in self.param_groups:
-            wd = group["weight_decay"]
+        # --- 1. Collect raw grads (with weight decay) then global-clip ---
+        grads = self._collect_grads()
+        grads = self._global_clip(grads)
 
+        # --- 2. Per-parameter Adam direction + extrapolation ---
+        for group in self.param_groups:
             for p in group["params"]:
-                if p.grad is None:
+                if p not in grads:
                     continue
 
-                grad = p.grad.detach().clone()
-
-                if wd > 0:
-                    grad = grad.add(p.data, alpha=wd)
-
-                # Correct gradient clipping on the detached tensor
-                grad = self._clip_grad_by_norm(grad)
+                grad = grads[p]
 
                 state = self._init_state(p)
                 state["step"] += 1  # step 1 of 2
@@ -185,6 +205,10 @@ class PCExtraGradientAdam(optim.Optimizer):
     def pc_update(self):
         eps = 1e-8
 
+        # --- 1. Collect grads at theta_half, global-clip ---
+        grads_half = self._collect_grads()
+        grads_half = self._global_clip(grads_half)
+
         all_x_minus_y: List[torch.Tensor] = []
         all_operator_diff: List[torch.Tensor] = []
         all_dk: List[torch.Tensor] = []
@@ -195,10 +219,8 @@ class PCExtraGradientAdam(optim.Optimizer):
         # Collect per-parameter quantities
         # --------------------------------------------------------
         for group in self.param_groups:
-            wd = group["weight_decay"]
-
             for p in group["params"]:
-                if p.grad is None:
+                if p not in grads_half:
                     continue
 
                 state = self.state[p]
@@ -207,12 +229,7 @@ class PCExtraGradientAdam(optim.Optimizer):
                 if "theta_k" not in state:
                     continue
 
-                grad_half = p.grad.detach().clone()
-
-                if wd > 0:
-                    grad_half = grad_half.add(p.data, alpha=wd)
-
-                grad_half = self._clip_grad_by_norm(grad_half)
+                grad_half = grads_half[p]
 
                 # NOTE: we do NOT increment step here — the second
                 # gradient evaluation is part of the same iteration.
@@ -323,43 +340,105 @@ class PCExtraGradientAdam(optim.Optimizer):
 # ============================================================
 
 class ProjectionContractionCallback(Callback):
+    """
+    Replaces the monolithic loss_objective optimizer with two separate optimizers:
+
+      actor_optimizer  — PCExtraGradientAdam (2-step VI)
+                         handles loss_objective + loss_entropy ONLY.
+                         These losses define the VI game operator.
+
+      critic_optimizer — plain Adam (1-step)
+                         handles loss_critic ONLY.
+                         The critic is a regression target, not a VI player.
+
+    Why separate?
+    -------------
+    The PC geometry (operator norm, Lipschitz step-size, beta_k) must reflect
+    only the actor's game dynamics.  Including critic gradients distorts both
+    the global norm used for clipping and the operator-difference estimate
+    F(theta_k) - F(theta_half), breaking the theoretical guarantees of the
+    projection-contraction method.
+    """
 
     def __init__(self):
         super().__init__()
-        self.optimizers: Dict[str, PCExtraGradientAdam] = {}
+        self.actor_optimizers: Dict[str, PCExtraGradientAdam] = {}
+        self.critic_optimizers: Dict[str, optim.Adam] = {}
 
     def on_setup(self):
         exp = self.experiment
+        algo_cfg = exp.algorithm_config
 
         for group in exp.group_map.keys():
 
-            if "loss_objective" not in exp.optimizers[group]:
-                continue
+            group_opts = exp.optimizers[group]
 
-            old_opt = exp.optimizers[group]["loss_objective"]
+            # --------------------------------------------------
+            # Actor: replace loss_objective optimizer with PC-VI
+            # --------------------------------------------------
+            if "loss_objective" in group_opts:
+                old_actor_opt = group_opts["loss_objective"]
 
-            algo_cfg = exp.algorithm_config
+                actor_opt = PCExtraGradientAdam(
+                    [{"params": pg["params"]} for pg in old_actor_opt.param_groups],
+                    lr=exp.config.lr,
+                    betas=getattr(algo_cfg, "extra_betas", (0.9, 0.999)),
+                    eps=getattr(exp.config, "adam_eps", 1e-8),
+                    weight_decay=getattr(exp.config, "weight_decay", 0.0),
+                    pc_beta=getattr(algo_cfg, "pc_beta", 1.0),
+                    pc_theta=getattr(algo_cfg, "pc_theta", 0.95),
+                    pc_lambda_min=getattr(algo_cfg, "pc_lambda_min", 1e-6),
+                    pc_lambda_max=getattr(algo_cfg, "pc_lambda_max", 1.0),
+                    pc_beta_min=getattr(algo_cfg, "pc_beta_min", 0.05),
+                    pc_beta_max=getattr(algo_cfg, "pc_beta_max", 2.0),
+                    grad_clip=getattr(algo_cfg, "grad_clip", 10.0),
+                )
 
-            new_opt = PCExtraGradientAdam(
-                [{"params": pg["params"]} for pg in old_opt.param_groups],
-                lr=exp.config.lr,
-                betas=getattr(algo_cfg, "extra_betas", (0.9, 0.999)),
-                eps=getattr(exp.config, "adam_eps", 1e-8),
-                weight_decay=getattr(exp.config, "weight_decay", 0.0),
-                pc_beta=getattr(algo_cfg, "pc_beta", 1.0),
-                pc_theta=getattr(algo_cfg, "pc_theta", 0.95),
-                pc_lambda_min=getattr(algo_cfg, "pc_lambda_min", 1e-6),
-                pc_lambda_max=getattr(algo_cfg, "pc_lambda_max", 1.0),
-                pc_beta_min=getattr(algo_cfg, "pc_beta_min", 0.05),
-                pc_beta_max=getattr(algo_cfg, "pc_beta_max", 2.0),
-                grad_clip=getattr(algo_cfg, "grad_clip", 10.0),
-            )
+                group_opts["loss_objective"] = actor_opt
+                self.actor_optimizers[group] = actor_opt
 
-            exp.optimizers[group]["loss_objective"] = new_opt
-            self.optimizers[group] = new_opt
+            # --------------------------------------------------
+            # Critic: keep (or create) a plain Adam optimizer.
+            # BenchMARL may already have a "loss_critic" optimizer;
+            # if not, we build one from the critic parameters
+            # exposed through the loss module.
+            # --------------------------------------------------
+            if "loss_critic" in group_opts:
+                # Already managed by BenchMARL — keep as-is but
+                # register it so we can call it explicitly.
+                self.critic_optimizers[group] = group_opts["loss_critic"]
+
+            elif "loss_critic" not in group_opts:
+                # BenchMARL merged critic params into loss_objective.
+                # Build a dedicated Adam from the critic sub-module.
+                loss_module = exp.losses[group]
+                critic_params = None
+
+                for attr in ("critic", "value_network", "critic_network"):
+                    sub = getattr(loss_module, attr, None)
+                    if sub is not None:
+                        critic_params = list(sub.parameters())
+                        break
+
+                if critic_params:
+                    critic_opt = optim.Adam(
+                        critic_params,
+                        lr=getattr(algo_cfg, "critic_lr", exp.config.lr),
+                        eps=getattr(exp.config, "adam_eps", 1e-8),
+                        weight_decay=getattr(exp.config, "weight_decay", 0.0),
+                    )
+                    group_opts["loss_critic"] = critic_opt
+                    self.critic_optimizers[group] = critic_opt
 
     # ============================================================
-    # Main MARL training hook — two-step VI update
+    # Main MARL training hook
+    #
+    # Order:
+    #   1. Critic step  (plain Adam, 1 forward+backward)
+    #   2. Actor step   (PC-VI, 2 forward+backward)
+    #
+    # The critic is updated first so that the value baseline used
+    # inside the actor loss is already fresh for this iteration.
     # ============================================================
 
     def on_train_step(
@@ -367,52 +446,55 @@ class ProjectionContractionCallback(Callback):
         batch: TensorDictBase,
         group: str,
     ):
-        if group not in self.optimizers:
-            return
-
-        optimizer = self.optimizers[group]
         exp = self.experiment
 
         # --------------------------------------------------------
-        # STEP 1 — gradient at theta_k, extrapolate to theta_half
+        # CRITIC — plain Adam, single step, isolated backward pass
+        # Only loss_critic flows through this optimizer.
         # --------------------------------------------------------
-        optimizer.zero_grad()
+        if group in self.critic_optimizers:
+            critic_opt = self.critic_optimizers[group]
+            critic_opt.zero_grad()
 
-        loss_vals = exp.losses[group](batch)
+            loss_vals_critic = exp.losses[group](batch)
 
-        actor_loss = loss_vals["loss_objective"]
+            if "loss_critic" in loss_vals_critic:
+                loss_vals_critic["loss_critic"].backward()
+                torch.nn.utils.clip_grad_norm_(
+                    [p for pg in critic_opt.param_groups for p in pg["params"]],
+                    max_norm=getattr(exp.algorithm_config, "grad_clip", 10.0),
+                )
+                critic_opt.step()
 
-        if "loss_entropy" in loss_vals:
-            actor_loss = actor_loss + loss_vals["loss_entropy"]
-
-        # Critic loss (was missing in original code)
-        if "loss_critic" in loss_vals:
-            actor_loss = actor_loss + loss_vals["loss_critic"]
-
-        actor_loss.backward()
-
-        optimizer.extrapolation_step()
+            critic_opt.zero_grad()
 
         # --------------------------------------------------------
-        # STEP 2 — gradient at theta_half, PC-VI update
+        # ACTOR — PC-VI two-step update
+        # Only loss_objective + loss_entropy flow through this optimizer.
+        # loss_critic is intentionally excluded.
         # --------------------------------------------------------
-        optimizer.zero_grad()
+        if group not in self.actor_optimizers:
+            return
 
-        loss_vals_half = exp.losses[group](batch)
+        actor_opt = self.actor_optimizers[group]
 
-        actor_loss_half = loss_vals_half["loss_objective"]
+        def _actor_loss(loss_vals) -> torch.Tensor:
+            loss = loss_vals["loss_objective"]
+            if "loss_entropy" in loss_vals:
+                loss = loss + loss_vals["loss_entropy"]
+            return loss
 
-        if "loss_entropy" in loss_vals_half:
-            actor_loss_half = actor_loss_half + loss_vals_half["loss_entropy"]
+        # --- Step 1: gradient at theta_k → extrapolate to theta_half ---
+        actor_opt.zero_grad()
+        _actor_loss(exp.losses[group](batch)).backward()
+        actor_opt.extrapolation_step()
 
-        if "loss_critic" in loss_vals_half:
-            actor_loss_half = actor_loss_half + loss_vals_half["loss_critic"]
+        # --- Step 2: gradient at theta_half → PC-VI update ---
+        actor_opt.zero_grad()
+        _actor_loss(exp.losses[group](batch)).backward()
+        actor_opt.pc_update()
 
-        actor_loss_half.backward()
-
-        optimizer.pc_update()
-
-        optimizer.zero_grad()
+        actor_opt.zero_grad()
 
         # --------------------------------------------------------
         # Logging
@@ -423,7 +505,7 @@ class ProjectionContractionCallback(Callback):
             exp.logger.log(
                 {
                     f"train/pc_vi/{group}/{k}": v
-                    for k, v in optimizer.last_stats.items()
+                    for k, v in actor_opt.last_stats.items()
                 },
                 step=exp.n_iters_performed,
             )
@@ -453,6 +535,9 @@ class IppoPCVI(IppoVI):
 
         grad_clip: float = 10.0,
 
+        # Critic (plain Adam, separate from VI)
+        critic_lr: float = 1e-3,
+
         pc_log_interval: int = 0,
 
         **kwargs,
@@ -471,6 +556,7 @@ class IppoPCVI(IppoVI):
         self.pc_beta_max = pc_beta_max
 
         self.grad_clip = grad_clip
+        self.critic_lr = critic_lr
 
         self.pc_log_interval = pc_log_interval
 
@@ -494,6 +580,9 @@ class IppoPCVIConfig(IppoVIConfig):
     pc_beta_max: float = 2.0
 
     grad_clip: float = 10.0
+
+    # Critic uses a plain Adam with its own (typically higher) lr
+    critic_lr: float = 1e-3
 
     pc_log_interval: int = 0
 
