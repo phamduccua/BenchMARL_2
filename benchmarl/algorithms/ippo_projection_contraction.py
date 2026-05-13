@@ -284,6 +284,10 @@ class PCExtraGradientAdam(optim.Optimizer):
         # --------------------------------------------------------
         # Adaptive step-size: lambda_{k+1}
         # Lipschitz-style: lambda <= theta * ||x - y|| / ||ΔF||
+        #
+        # FIX: do NOT include self.current_lr in min().
+        # The old code ratcheted lr monotonically downward to
+        # pc_lambda_min and never recovered, killing actor updates.
         # --------------------------------------------------------
         if grad_dist.item() > eps:
             candidate_lr = (self.pc_theta * param_dist / (grad_dist + eps)).item()
@@ -292,18 +296,40 @@ class PCExtraGradientAdam(optim.Optimizer):
 
         adaptive_lr = float(
             max(self.pc_lambda_min,
-                min(candidate_lr, self.pc_lambda_max, self.current_lr))
+                min(candidate_lr, self.pc_lambda_max))  # removed self.current_lr
         )
 
         # --------------------------------------------------------
         # Contraction coefficient: beta_k
         # beta_k = pc_beta * <x-y, d_k> / ||d_k||^2
-        # Clipped to [pc_beta_min, pc_beta_max] for stability
+        #
+        # FIX: if numerator <= 0, d_k points away from the descent
+        # direction — the PC contraction is invalid. Fall back to
+        # keeping theta_half (the extrapolated point) as the update.
         # --------------------------------------------------------
-        beta_k = float(
-            max(self.pc_beta_min,
-                min(self.pc_beta * numerator / dk_norm_sq, self.pc_beta_max))
-        )
+        raw_beta = (self.pc_beta * numerator / dk_norm_sq).item()
+
+        if raw_beta <= 0:
+            # d_k not a valid contraction direction; keep theta_half
+            for (p, state, exp_avg_new, exp_avg_sq_new, d_k) in cache:
+                # p.data already holds theta_half — nothing to change
+                state["exp_avg"].copy_(exp_avg_new)
+                state["exp_avg_sq"].copy_(exp_avg_sq_new)
+                del state["theta_k"]
+                del state["theta_half"]
+                del state["F_theta_k"]
+            self.current_lr = adaptive_lr
+            self.last_stats = {
+                "lambda_k": self.current_lr,
+                "beta_k": 0.0,
+                "skipped_pc": True,
+                "param_dist": param_dist.item(),
+                "grad_dist": grad_dist.item(),
+                "dk_norm": torch.norm(d_k_vec).item(),
+            }
+            return
+
+        beta_k = float(max(self.pc_beta_min, min(raw_beta, self.pc_beta_max)))
 
         # --------------------------------------------------------
         # Apply update: theta_{k+1} = theta_k - beta_k * d_k
@@ -434,11 +460,13 @@ class ProjectionContractionCallback(Callback):
     # Main MARL training hook
     #
     # Order:
-    #   1. Critic step  (plain Adam, 1 forward+backward)
-    #   2. Actor step   (PC-VI, 2 forward+backward)
+    #   1. Actor step   (PC-VI, 2 forward+backward)  ← FIRST
+    #   2. Critic step  (plain Adam, 1 forward+backward)
     #
-    # The critic is updated first so that the value baseline used
-    # inside the actor loss is already fresh for this iteration.
+    # Actor goes FIRST because the batch has precomputed advantages
+    # from rollout time.  Updating the critic first would shift
+    # value-network weights without updating the stored advantages,
+    # creating a stale-baseline mismatch inside loss_objective.
     # ============================================================
 
     def on_train_step(
@@ -449,8 +477,34 @@ class ProjectionContractionCallback(Callback):
         exp = self.experiment
 
         # --------------------------------------------------------
+        # ACTOR — PC-VI two-step update (always first)
+        # Only loss_objective + loss_entropy define the VI operator.
+        # loss_critic is intentionally excluded.
+        # --------------------------------------------------------
+        if group in self.actor_optimizers:
+            actor_opt = self.actor_optimizers[group]
+
+            def _actor_loss(loss_vals) -> torch.Tensor:
+                loss = loss_vals["loss_objective"]
+                if "loss_entropy" in loss_vals:
+                    loss = loss + loss_vals["loss_entropy"]
+                return loss
+
+            # Step 1: gradient at theta_k → extrapolate to theta_half
+            actor_opt.zero_grad()
+            _actor_loss(exp.losses[group](batch)).backward()
+            actor_opt.extrapolation_step()
+
+            # Step 2: gradient at theta_half → PC-VI update
+            actor_opt.zero_grad()
+            _actor_loss(exp.losses[group](batch)).backward()
+            actor_opt.pc_update()
+
+            actor_opt.zero_grad()
+
+        # --------------------------------------------------------
         # CRITIC — plain Adam, single step, isolated backward pass
-        # Only loss_critic flows through this optimizer.
+        # Updated AFTER actor; critic regression on current V targets.
         # --------------------------------------------------------
         if group in self.critic_optimizers:
             critic_opt = self.critic_optimizers[group]
@@ -468,33 +522,10 @@ class ProjectionContractionCallback(Callback):
 
             critic_opt.zero_grad()
 
-        # --------------------------------------------------------
-        # ACTOR — PC-VI two-step update
-        # Only loss_objective + loss_entropy flow through this optimizer.
-        # loss_critic is intentionally excluded.
-        # --------------------------------------------------------
         if group not in self.actor_optimizers:
             return
 
         actor_opt = self.actor_optimizers[group]
-
-        def _actor_loss(loss_vals) -> torch.Tensor:
-            loss = loss_vals["loss_objective"]
-            if "loss_entropy" in loss_vals:
-                loss = loss + loss_vals["loss_entropy"]
-            return loss
-
-        # --- Step 1: gradient at theta_k → extrapolate to theta_half ---
-        actor_opt.zero_grad()
-        _actor_loss(exp.losses[group](batch)).backward()
-        actor_opt.extrapolation_step()
-
-        # --- Step 2: gradient at theta_half → PC-VI update ---
-        actor_opt.zero_grad()
-        _actor_loss(exp.losses[group](batch)).backward()
-        actor_opt.pc_update()
-
-        actor_opt.zero_grad()
 
         # --------------------------------------------------------
         # Logging
