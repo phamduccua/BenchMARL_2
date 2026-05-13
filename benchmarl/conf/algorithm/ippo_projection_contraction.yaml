@@ -4,7 +4,7 @@ defaults:
 
 share_param_critic: False
 clip_epsilon: 0.2
-entropy_coef: 0.0
+entropy_coef: 0.01
 critic_coef: 1.0
 loss_critic_type: "l2"
 lmbda: 0.9
@@ -24,20 +24,14 @@ pc_beta: 1.0
 # pc_theta: fraction of ||u-v|| / ||F(u)-F(v)|| dùng để tính lambda_{k+1}
 pc_theta: 0.95
 
-# pc_gamma: fallback beta_k khi numerator <= 0
-pc_gamma: 0.0
-
 # pc_lambda_min / pc_lambda_max: clamp bounds cho adaptive step-size lambda_k
 pc_lambda_min: 1.0e-6
-pc_lambda_max: 5.0e-4
-
-# pc_lambda_growth / pc_lambda_rho: limit per-update lambda growth to avoid
-# overly aggressive actor steps on matrix games.
-pc_lambda_growth: 2.0
-pc_lambda_rho: 1.0e-4
+pc_lambda_max: 1.0e-3
 
 # pc_beta_min / pc_beta_max: clamp bounds cho beta_k
-pc_beta_min: 0.0
+# pc_beta_min also acts as the fallback threshold: if raw_beta < pc_beta_min,
+# the contraction step is too weak and we fall back to EG (keep theta_half).
+pc_beta_min: 0.3
 pc_beta_max: 1.0
 
 # grad_clip: gradient clipping value

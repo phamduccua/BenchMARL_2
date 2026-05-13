@@ -1,300 +1,367 @@
-from __future__ import annotations
-
-import math
-from typing import Dict, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
 import torch
 import torch.optim as optim
-from benchmarl.algorithms.ippo_vi import IppoVI, IppoVIConfig
-from benchmarl.experiment.callback import Callback
-from dataclasses import dataclass
 from tensordict import TensorDictBase
 
+from benchmarl.algorithms.ippo_vi import IppoVI, IppoVIConfig
+from benchmarl.experiment.callback import Callback
+
 
 # ============================================================
-# Projection-Contraction Optimizer (Algorithm 2 — Chuẩn)
-#
-# Mỗi iteration gồm 2 bước:
-#   Step 1 (extrapolation_step):
-#       v_k = u_k − λ_k · AdamDir(grad(u_k))
-#       Lưu: u_k, F_u_k = AdamDir(grad(u_k)), v_k
-#
-#   Step 2 (pc_update):
-#       Tính F_v_k = AdamDir(grad(v_k))
-#       d_k = λ_k · F_v_k       (vì x − y = λ_k·F(x), nên d_k = λ_k·F(y))
-#       β_k = <u_k − v_k, d_k> / ||d_k||²   (chỉ dùng khi > 0)
-#       u_{k+1} = u_k − β_k · d_k
-#
-#   Adaptive step-size cho bước tiếp theo:
-#       λ_{k+1} = clip( θ · ||u_k − v_k|| / ||F(u_k) − F(v_k)|| )
+# Projection-Contraction Extra-Gradient Adam
+# Variational Inequality MARL Optimizer
 # ============================================================
 
-class PCOptimizer(optim.Optimizer):
+class PCExtraGradientAdam(optim.Optimizer):
+
     def __init__(
         self,
         params,
+
         # Adam
-        lr=3e-4,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        # PC Algorithm 2 params
-        pc_beta=1.0,      # β trong công thức beta_k
-        pc_theta=0.95,    # θ trong adaptive step-size
-        pc_gamma=0.0,     # fallback beta_k khi numerator ≤ 0
-        # Clipping
-        grad_clip=10.0,
-        lambda_min=1e-6,
-        lambda_max=5e-4,
-        lambda_growth=2.0,
-        lambda_rho=1e-4,
-        beta_min=0.0,
-        beta_max=1.0,
+        lr: float = 3e-4,
+        betas: Tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+
+        # Projection-Contraction
+        pc_beta: float = 1.0,
+        pc_theta: float = 0.95,
+
+        # stability
+        pc_lambda_min: float = 1e-6,
+        pc_lambda_max: float = 1e-3,
+
+        pc_beta_min: float = 0.3,
+        pc_beta_max: float = 1.0,
+
+        grad_clip: float = 10.0,
     ):
-        defaults = dict(lr=lr, betas=betas, eps=eps)
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+        )
+
         super().__init__(params, defaults)
 
-        self.current_lr = lr        # λ_k (adaptive step-size)
-        self.initial_lr = lr
+        self.current_lr = lr
+
         self.pc_beta = pc_beta
         self.pc_theta = pc_theta
-        self.pc_gamma = pc_gamma
-        self.grad_clip = grad_clip
-        self.lambda_min = lambda_min
-        self.lambda_max = lambda_max
-        self.lambda_growth = lambda_growth
-        self.lambda_rho = lambda_rho
-        self.beta_min = beta_min
-        self.beta_max = beta_max
 
-        self.iteration = 0
-        self._cache = []            # lưu thông tin từ extrapolation_step
+        self.pc_lambda_min = pc_lambda_min
+        self.pc_lambda_max = pc_lambda_max
+
+        self.pc_beta_min = pc_beta_min
+        self.pc_beta_max = pc_beta_max
+
+        self.grad_clip = grad_clip
+
         self.last_stats = {}
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
+    # ============================================================
+    # Utilities
+    # ============================================================
 
-    def _collect_grads(self):
-        """Thu thập gradient hiện tại và clip global norm."""
-        grads = {}
-        total_norm_sq = 0.0
+    def _collect_grads(self) -> Dict[torch.Tensor, torch.Tensor]:
+        """
+        Collect detached gradients (+ weight decay) for every parameter
+        that has a gradient.  Returns {p: grad} mapping.
+        """
+        grads: Dict[torch.Tensor, torch.Tensor] = {}
         for group in self.param_groups:
+            wd = group["weight_decay"]
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 g = p.grad.detach().clone()
+                if wd > 0:
+                    g = g.add(p.data, alpha=wd)
                 grads[p] = g
-                total_norm_sq += g.norm().item() ** 2
-
-        total_norm = math.sqrt(total_norm_sq)
-        if total_norm > self.grad_clip:
-            coef = self.grad_clip / (total_norm + 1e-6)
-            for p in grads:
-                grads[p].mul_(coef)
         return grads
 
-    def _adam_direction(self, grad, exp_avg, exp_avg_sq, step, beta1, beta2, eps):
-        """Tính Adam update direction (bias-corrected), KHÔNG cập nhật moments."""
-        m = beta1 * exp_avg + (1.0 - beta1) * grad
-        v = beta2 * exp_avg_sq + (1.0 - beta2) * grad * grad
+    def _global_clip(
+        self,
+        grads: Dict[torch.Tensor, torch.Tensor],
+    ) -> Dict[torch.Tensor, torch.Tensor]:
+        """
+        True global-norm clipping:
+
+            g  ←  g · c / max(‖g‖_global, c)
+
+        where ‖g‖_global = sqrt( Σ_i ‖g_i‖² ) over ALL parameters.
+        Each tensor is scaled by the SAME scalar, so relative directions
+        are preserved exactly — identical to PyTorch's clip_grad_norm_.
+        """
+        global_norm = torch.sqrt(
+            sum(g.norm() ** 2 for g in grads.values())
+        )
+        clip_coef = self.grad_clip / (global_norm + 1e-6)
+        if clip_coef < 1.0:
+            grads = {p: g * clip_coef for p, g in grads.items()}
+        return grads
+
+    # ============================================================
+    # Adam preconditioned direction (stateless read)
+    # Does NOT mutate state — only reads current moments.
+    # ============================================================
+
+    def _adam_direction(
+        self,
+        grad: torch.Tensor,
+        exp_avg: torch.Tensor,
+        exp_avg_sq: torch.Tensor,
+        step: int,
+        group: dict,
+    ) -> torch.Tensor:
+        """
+        Compute the Adam-preconditioned direction given pre-computed
+        moment estimates and a step counter.  Pure function — no side effects.
+        """
+        beta1, beta2 = group["betas"]
+        eps = group["eps"]
+
+        new_exp_avg = beta1 * exp_avg + (1 - beta1) * grad
+        new_exp_avg_sq = beta2 * exp_avg_sq + (1 - beta2) * grad * grad
+
         bc1 = 1.0 - beta1 ** step
         bc2 = 1.0 - beta2 ** step
-        direction = (m / bc1) / (v.sqrt() / math.sqrt(bc2) + eps)
-        return direction, m, v
 
-    def _init_state(self, p):
+        denom = (new_exp_avg_sq.sqrt() / (bc2 ** 0.5)).add_(eps)
+        direction = (new_exp_avg / bc1) / denom
+
+        return direction, new_exp_avg, new_exp_avg_sq
+
+    # ============================================================
+    # Initialise state for a parameter if not yet done
+    # ============================================================
+
+    def _init_state(self, p: torch.Tensor) -> dict:
         state = self.state[p]
-        if not state:
+        if len(state) == 0:
             state["step"] = 0
             state["exp_avg"] = torch.zeros_like(p.data)
             state["exp_avg_sq"] = torch.zeros_like(p.data)
         return state
 
-    # ── Step 1: Extrapolation ─────────────────────────────────────────────────
+    # ============================================================
+    # STEP 1: extrapolation
+    # theta_half = theta_k - lambda * F_adam(theta_k)
+    #
+    # Saves: theta_k, F_theta_k (Adam direction at theta_k),
+    #        exp_avg / exp_avg_sq AFTER the first gradient.
+    # ============================================================
 
     @torch.no_grad()
     def extrapolation_step(self):
-        """
-        Tính v_k = u_k − λ_k · AdamDir(grad(u_k)).
-        Lưu u_k, F(u_k), v_k vào cache.
-        """
+        # --- 1. Collect raw grads (with weight decay) then global-clip ---
         grads = self._collect_grads()
-        self._cache = []
+        grads = self._global_clip(grads)
 
+        # --- 2. Per-parameter Adam direction + extrapolation ---
         for group in self.param_groups:
-            beta1, beta2 = group["betas"]
-            eps = group["eps"]
-
             for p in group["params"]:
                 if p not in grads:
                     continue
 
-                state = self._init_state(p)
-                state["step"] += 1
+                grad = grads[p]
 
-                F_u_k, new_m, new_v = self._adam_direction(
-                    grads[p],
+                state = self._init_state(p)
+                state["step"] += 1  # step 1 of 2
+
+                direction, new_exp_avg, new_exp_avg_sq = self._adam_direction(
+                    grad,
                     state["exp_avg"],
                     state["exp_avg_sq"],
                     state["step"],
-                    beta1, beta2, eps,
+                    group,
                 )
 
-                u_k = p.data.clone()
-                v_k = u_k - self.current_lr * F_u_k
+                # Persist moments from the first gradient evaluation
+                state["exp_avg"].copy_(new_exp_avg)
+                state["exp_avg_sq"].copy_(new_exp_avg_sq)
 
-                # Lưu để dùng ở pc_update
-                self._cache.append({
-                    "p": p,
-                    "state": state,
-                    "u_k": u_k,
-                    "v_k": v_k,
-                    "F_u_k": F_u_k,
-                    "new_m": new_m,
-                    "new_v": new_v,
-                    "beta1": beta1, "beta2": beta2, "eps": eps,
-                })
+                # Save anchor point and operator value
+                state["theta_k"] = p.data.clone()
+                state["F_theta_k"] = direction.clone()
 
-                # Di chuyển tham số đến v_k để tính loss tại v_k
-                p.data.copy_(v_k)
+                # Extrapolated point
+                theta_half = p.data - self.current_lr * direction
+                state["theta_half"] = theta_half.clone()
 
-    # ── Step 2: PC Update ─────────────────────────────────────────────────────
+                p.data.copy_(theta_half)
+
+    # ============================================================
+    # STEP 2: projection-contraction update
+    # theta_{k+1} = theta_k - beta_k * d_k
+    # where d_k = (theta_k - theta_half) - lambda * (F(theta_k) - F(theta_half))
+    # ============================================================
 
     @torch.no_grad()
     def pc_update(self):
-        """
-        Tính PC update từ grad(v_k):
-            d_k   = λ_k · F(v_k)
-            β_k   = <u_k − v_k, d_k> / ||d_k||²
-            u_{k+1} = u_k − β_k · d_k
-        Rồi tính λ_{k+1} = θ · ||u_k − v_k|| / ||F(u_k) − F(v_k)||.
-        """
-        if not self._cache:
+        eps = 1e-8
+
+        # --- 1. Collect grads at theta_half, global-clip ---
+        grads_half = self._collect_grads()
+        grads_half = self._global_clip(grads_half)
+
+        all_x_minus_y: List[torch.Tensor] = []
+        all_operator_diff: List[torch.Tensor] = []
+        all_dk: List[torch.Tensor] = []
+
+        cache = []
+
+        # --------------------------------------------------------
+        # Collect per-parameter quantities
+        # --------------------------------------------------------
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p not in grads_half:
+                    continue
+
+                state = self.state[p]
+
+                # Guard: extrapolation_step must have been called first
+                if "theta_k" not in state:
+                    continue
+
+                grad_half = grads_half[p]
+
+                # NOTE: we do NOT increment step here — the second
+                # gradient evaluation is part of the same iteration.
+                # We reuse state["step"] (already incremented above)
+                # to keep bias correction consistent.
+                direction_half, exp_avg_new, exp_avg_sq_new = self._adam_direction(
+                    grad_half,
+                    state["exp_avg"],
+                    state["exp_avg_sq"],
+                    state["step"],
+                    group,
+                )
+
+                F_theta_k = state["F_theta_k"]
+
+                # x - y  ≡  theta_k - theta_half
+                x_minus_y = state["theta_k"] - state["theta_half"]
+
+                # ΔF ≡  F(theta_k) - F(theta_half)
+                operator_diff = F_theta_k - direction_half
+
+                # d_k = (theta_k - theta_half) - lambda * (F(theta_k) - F(theta_half))
+                d_k = x_minus_y - self.current_lr * operator_diff
+
+                all_x_minus_y.append(x_minus_y.reshape(-1))
+                all_operator_diff.append(operator_diff.reshape(-1))
+                all_dk.append(d_k.reshape(-1))
+
+                cache.append((
+                    p,
+                    state,
+                    exp_avg_new,
+                    exp_avg_sq_new,
+                    d_k,
+                ))
+
+        if not cache:
             return
 
-        grads_vk = self._collect_grads()
+        # --------------------------------------------------------
+        # Global vector geometry
+        # --------------------------------------------------------
+        x_minus_y_vec = torch.cat(all_x_minus_y)
+        operator_diff_vec = torch.cat(all_operator_diff)
+        d_k_vec = torch.cat(all_dk)
 
-        # --- Thu thập vectors toàn cục để tính β_k và λ_{k+1} ---
-        all_xmy = []      # u_k - v_k  (= λ_k * F_u_k)
-        all_fvk  = []     # F(v_k)
-        all_fdiff = []    # F(u_k) - F(v_k)
-        entry_data = []   # (entry, F_v_k per-param)
+        param_dist = torch.norm(x_minus_y_vec)
+        grad_dist = torch.norm(operator_diff_vec)
+        dk_norm_sq = torch.sum(d_k_vec * d_k_vec) + eps
+        numerator = torch.sum(x_minus_y_vec * d_k_vec)
 
-        for entry in self._cache:
-            p = entry["p"]
-            if p not in grads_vk:
-                # Không có grad → bỏ qua param này
-                continue
-
-            state = entry["state"]
-            beta1, beta2, eps = entry["beta1"], entry["beta2"], entry["eps"]
-
-            # Tính F(v_k) với moments từ bước extrapolation (new_m, new_v)
-            F_v_k, _, _ = self._adam_direction(
-                grads_vk[p],
-                entry["new_m"],
-                entry["new_v"],
-                state["step"],
-                beta1, beta2, eps,
-            )
-
-            x_minus_y = entry["u_k"] - entry["v_k"]   # = λ_k * F_u_k
-            f_diff = entry["F_u_k"] - F_v_k
-
-            all_xmy.append(x_minus_y.reshape(-1))
-            all_fvk.append(F_v_k.reshape(-1))
-            all_fdiff.append(f_diff.reshape(-1))
-            entry_data.append((entry, F_v_k))
-
-        if not entry_data:
-            # Không có gì để update, khôi phục tham số
-            for entry in self._cache:
-                entry["p"].data.copy_(entry["u_k"])
-            self._cache = []
-            return
-
-        xmy_vec  = torch.cat(all_xmy)
-        fvk_vec  = torch.cat(all_fvk)
-        fdiff_vec = torch.cat(all_fdiff)
-
-        # --- Tính β_k ---
-        # d_k = λ_k * F(v_k)  →  ||d_k||² = λ_k² * ||F(v_k)||²
-        # <u_k - v_k, d_k> = <λ_k*F(u_k), λ_k*F(v_k)> = λ_k² * <F(u_k), F(v_k)>
-        # β_k = <u_k - v_k, d_k> / ||d_k||²
-        #      = λ_k² * <F(u_k), F(v_k)> / (λ_k² * ||F(v_k)||²)
-        #      = <F(u_k), F(v_k)> / ||F(v_k)||²
-        # (λ_k triệt tiêu — β_k không phụ thuộc λ_k!)
+        # --------------------------------------------------------
+        # Adaptive step-size: lambda_{k+1}
+        # Lipschitz-style: lambda <= theta * ||x - y|| / ||ΔF||
         #
-        # Công thức trực tiếp theo định nghĩa gốc:
-        fvk_norm_sq = torch.sum(fvk_vec * fvk_vec).item()
-        eps_safe = 1e-12
-
-        if fvk_norm_sq > eps_safe:
-            raw_beta = self.pc_beta * torch.dot(xmy_vec, self.current_lr * fvk_vec).item() / (
-                self.current_lr ** 2 * fvk_norm_sq + eps_safe
-            )
-            # Tương đương: raw_beta = pc_beta * <F_u, F_v> / ||F_v||²
-            if raw_beta <= 0:
-                beta_k = self.pc_gamma
-            else:
-                beta_k = max(self.beta_min, min(self.beta_max, raw_beta))
+        # FIX: do NOT include self.current_lr in min().
+        # The old code ratcheted lr monotonically downward to
+        # pc_lambda_min and never recovered, killing actor updates.
+        # --------------------------------------------------------
+        if grad_dist.item() > eps:
+            candidate_lr = (self.pc_theta * param_dist / (grad_dist + eps)).item()
         else:
-            beta_k = self.pc_gamma
+            candidate_lr = self.current_lr
 
-        # --- Tính λ_{k+1} (adaptive step-size) ---
-        param_dist = torch.norm(xmy_vec).item()
-        grad_dist  = torch.norm(fdiff_vec).item()
-
-        if grad_dist > eps_safe:
-            lambda_next = self.pc_theta * param_dist / (grad_dist + eps_safe)
-        else:
-            lambda_next = self.current_lr
-
-        lambda_next = min(
-            lambda_next,
-            self.current_lr * self.lambda_growth,
-            self.current_lr + self.lambda_rho,
+        adaptive_lr = float(
+            max(self.pc_lambda_min,
+                min(candidate_lr, self.pc_lambda_max))  # removed self.current_lr
         )
-        lambda_next = max(self.lambda_min, min(self.lambda_max, lambda_next))
 
-        # --- Áp dụng update cho từng tham số ---
-        for (entry, F_v_k) in entry_data:
-            p = entry["p"]
-            state = entry["state"]
+        # --------------------------------------------------------
+        # Contraction coefficient: beta_k
+        # beta_k = pc_beta * <x-y, d_k> / ||d_k||^2
+        #
+        # FIX: if numerator <= 0, d_k points away from the descent
+        # direction — the PC contraction is invalid. Fall back to
+        # keeping theta_half (the extrapolated point) as the update.
+        # --------------------------------------------------------
+        raw_beta = (self.pc_beta * numerator / dk_norm_sq).item()
 
-            # d_k = λ_k * F(v_k)
-            d_k = self.current_lr * F_v_k
+        # Fall back to EG (keep theta_half) when the contraction direction is
+        # invalid (raw_beta <= 0) OR too weak (raw_beta < pc_beta_min).
+        # A clamped-up beta would overshoot past the intended contraction
+        # geometry, so it is better to use the EG point in that regime.
+        if raw_beta < self.pc_beta_min:
+            for (p, state, exp_avg_new, exp_avg_sq_new, d_k) in cache:
+                # p.data already holds theta_half — nothing to change
+                state["exp_avg"].copy_(exp_avg_new)
+                state["exp_avg_sq"].copy_(exp_avg_sq_new)
+                del state["theta_k"]
+                del state["theta_half"]
+                del state["F_theta_k"]
+            self.current_lr = adaptive_lr
+            self.last_stats = {
+                "lambda_k": self.current_lr,
+                "beta_k": 0.0,
+                "skipped_pc": True,
+                "param_dist": param_dist.item(),
+                "grad_dist": grad_dist.item(),
+                "dk_norm": torch.norm(d_k_vec).item(),
+            }
+            return
 
-            # u_{k+1} = u_k - β_k * d_k
-            u_next = entry["u_k"] - beta_k * d_k
-            p.data.copy_(u_next)
+        beta_k = float(min(raw_beta, self.pc_beta_max))
 
-            # Commit Adam moments (từ bước extrapolation tại u_k)
-            state["exp_avg"].copy_(entry["new_m"])
-            state["exp_avg_sq"].copy_(entry["new_v"])
+        # --------------------------------------------------------
+        # Apply update: theta_{k+1} = theta_k - beta_k * d_k
+        # --------------------------------------------------------
+        for (p, state, exp_avg_new, exp_avg_sq_new, d_k) in cache:
 
-        # Xử lý các params không có grad (khôi phục về u_k)
-        updated_params = {entry["p"] for entry, _ in entry_data}
-        for entry in self._cache:
-            if entry["p"] not in updated_params:
-                entry["p"].data.copy_(entry["u_k"])
+            # Restore to anchor theta_k, then apply contraction
+            p.data.copy_(state["theta_k"])
+            p.data.add_(d_k, alpha=-beta_k)  # subtract beta_k * d_k
 
-        self._cache = []
-        self.current_lr = lambda_next
-        self.iteration += 1
+            # Commit updated Adam moments
+            state["exp_avg"].copy_(exp_avg_new)
+            state["exp_avg_sq"].copy_(exp_avg_sq_new)
+
+            # Clean up per-iteration temporaries
+            del state["theta_k"]
+            del state["theta_half"]
+            del state["F_theta_k"]
+
+        self.current_lr = adaptive_lr
+
         self.last_stats = {
             "lambda_k": self.current_lr,
             "beta_k": beta_k,
-            "param_dist": param_dist,
-            "grad_dist": grad_dist,
+            "final_step": beta_k * self.current_lr,
+            "param_dist": param_dist.item(),
+            "grad_dist": grad_dist.item(),
+            "dk_norm": torch.norm(d_k_vec).item(),
         }
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-        self.extrapolation_step()
-        return loss
 
 
 # ============================================================
@@ -302,121 +369,257 @@ class PCOptimizer(optim.Optimizer):
 # ============================================================
 
 class ProjectionContractionCallback(Callback):
+    """
+    Replaces the monolithic loss_objective optimizer with two separate optimizers:
+
+      actor_optimizer  — PCExtraGradientAdam (2-step VI)
+                         handles loss_objective + loss_entropy ONLY.
+                         These losses define the VI game operator.
+
+      critic_optimizer — plain Adam (1-step)
+                         handles loss_critic ONLY.
+                         The critic is a regression target, not a VI player.
+
+    Why separate?
+    -------------
+    The PC geometry (operator norm, Lipschitz step-size, beta_k) must reflect
+    only the actor's game dynamics.  Including critic gradients distorts both
+    the global norm used for clipping and the operator-difference estimate
+    F(theta_k) - F(theta_half), breaking the theoretical guarantees of the
+    projection-contraction method.
+    """
+
     def __init__(self):
         super().__init__()
-        self.actor_optimizers: Dict[str, PCOptimizer] = {}
+        self.actor_optimizers: Dict[str, PCExtraGradientAdam] = {}
+        self.critic_optimizers: Dict[str, optim.Adam] = {}
 
-    def on_setup(self) -> None:
+    def on_setup(self):
         exp = self.experiment
         algo_cfg = exp.algorithm_config
 
         for group in exp.group_map.keys():
+
             group_opts = exp.optimizers[group]
 
-            # Khởi tạo Actor Optimizer
+            # --------------------------------------------------
+            # Actor: replace loss_objective optimizer with PC-VI
+            # --------------------------------------------------
             if "loss_objective" in group_opts:
-                old_opt = group_opts["loss_objective"]
-                actor_opt = PCOptimizer(
-                    params=[{"params": pg["params"]} for pg in old_opt.param_groups],
+                old_actor_opt = group_opts["loss_objective"]
+
+                actor_opt = PCExtraGradientAdam(
+                    [{"params": pg["params"]} for pg in old_actor_opt.param_groups],
                     lr=exp.config.lr,
                     betas=getattr(algo_cfg, "extra_betas", (0.9, 0.999)),
                     eps=getattr(exp.config, "adam_eps", 1e-8),
+                    weight_decay=getattr(exp.config, "weight_decay", 0.0),
                     pc_beta=getattr(algo_cfg, "pc_beta", 1.0),
                     pc_theta=getattr(algo_cfg, "pc_theta", 0.95),
-                    pc_gamma=getattr(algo_cfg, "pc_gamma", 0.0),
+                    pc_lambda_min=getattr(algo_cfg, "pc_lambda_min", 1e-6),
+                    pc_lambda_max=getattr(algo_cfg, "pc_lambda_max", 1.0),
+                    pc_beta_min=getattr(algo_cfg, "pc_beta_min", 0.05),
+                    pc_beta_max=getattr(algo_cfg, "pc_beta_max", 2.0),
                     grad_clip=getattr(algo_cfg, "grad_clip", 10.0),
-                    lambda_min=getattr(algo_cfg, "pc_lambda_min", 1e-6),
-                    lambda_max=getattr(algo_cfg, "pc_lambda_max", 5e-4),
-                    lambda_growth=getattr(algo_cfg, "pc_lambda_growth", 2.0),
-                    lambda_rho=getattr(algo_cfg, "pc_lambda_rho", 1e-4),
-                    beta_min=getattr(algo_cfg, "pc_beta_min", 0.0),
-                    beta_max=getattr(algo_cfg, "pc_beta_max", 1.0),
                 )
+
                 group_opts["loss_objective"] = actor_opt
                 self.actor_optimizers[group] = actor_opt
 
-    def on_train_step(self, batch: TensorDictBase, group: str) -> None:
+            # --------------------------------------------------
+            # Critic: keep (or create) a plain Adam optimizer.
+            # BenchMARL may already have a "loss_critic" optimizer;
+            # if not, we build one from the critic parameters
+            # exposed through the loss module.
+            # --------------------------------------------------
+            if "loss_critic" in group_opts:
+                # Already managed by BenchMARL — keep as-is but
+                # register it so we can call it explicitly.
+                self.critic_optimizers[group] = group_opts["loss_critic"]
+
+            elif "loss_critic" not in group_opts:
+                # BenchMARL merged critic params into loss_objective.
+                # Build a dedicated Adam from the critic sub-module.
+                loss_module = exp.losses[group]
+                critic_params = None
+
+                for attr in ("critic", "value_network", "critic_network"):
+                    sub = getattr(loss_module, attr, None)
+                    if sub is not None:
+                        critic_params = list(sub.parameters())
+                        break
+
+                if critic_params:
+                    critic_opt = optim.Adam(
+                        critic_params,
+                        lr=getattr(algo_cfg, "critic_lr", exp.config.lr),
+                        eps=getattr(exp.config, "adam_eps", 1e-8),
+                        weight_decay=getattr(exp.config, "weight_decay", 0.0),
+                    )
+                    group_opts["loss_critic"] = critic_opt
+                    self.critic_optimizers[group] = critic_opt
+
+    # ============================================================
+    # Main MARL training hook
+    #
+    # Order:
+    #   1. Actor step   (PC-VI, 2 forward+backward)  ← FIRST
+    #   2. Critic step  (plain Adam, 1 forward+backward)
+    #
+    # Actor goes FIRST because the batch has precomputed advantages
+    # from rollout time.  Updating the critic first would shift
+    # value-network weights without updating the stored advantages,
+    # creating a stale-baseline mismatch inside loss_objective.
+    # ============================================================
+
+    def on_train_step(
+        self,
+        batch: TensorDictBase,
+        group: str,
+    ):
         exp = self.experiment
-        algo_cfg = exp.algorithm_config
 
+        # --------------------------------------------------------
+        # ACTOR — PC-VI two-step update (always first)
+        # Only loss_objective + loss_entropy define the VI operator.
+        # loss_critic is intentionally excluded.
+        # --------------------------------------------------------
         if group in self.actor_optimizers:
             actor_opt = self.actor_optimizers[group]
-            loss_vals = exp.losses[group](batch.clone(True))
-            actor_loss = loss_vals["loss_objective"]
-            if "loss_entropy" in loss_vals:
-                actor_loss = actor_loss + loss_vals["loss_entropy"]
+
+            def _actor_loss(loss_vals) -> torch.Tensor:
+                loss = loss_vals["loss_objective"]
+                if "loss_entropy" in loss_vals:
+                    loss = loss + loss_vals["loss_entropy"]
+                return loss
+
+            # Step 1: gradient at theta_k → extrapolate to theta_half
+            actor_opt.zero_grad()
+            _actor_loss(exp.losses[group](batch)).backward()
+            actor_opt.extrapolation_step()
+
+            # Step 2: gradient at theta_half → PC-VI update
+            actor_opt.zero_grad()
+            _actor_loss(exp.losses[group](batch)).backward()
+            actor_opt.pc_update()
 
             actor_opt.zero_grad()
-            actor_loss.backward()
-            actor_opt.pc_update()            # tham số về u_{k+1}
-            actor_opt.zero_grad()
 
+        # --------------------------------------------------------
+        # CRITIC — plain Adam, single step, isolated backward pass
+        # Updated AFTER actor; critic regression on current V targets.
+        # --------------------------------------------------------
+        if group in self.critic_optimizers:
+            critic_opt = self.critic_optimizers[group]
+            critic_opt.zero_grad()
+
+            loss_vals_critic = exp.losses[group](batch)
+
+            if "loss_critic" in loss_vals_critic:
+                loss_vals_critic["loss_critic"].backward()
+                torch.nn.utils.clip_grad_norm_(
+                    [p for pg in critic_opt.param_groups for p in pg["params"]],
+                    max_norm=getattr(exp.algorithm_config, "grad_clip", 10.0),
+                )
+                critic_opt.step()
+
+            critic_opt.zero_grad()
+
+        if group not in self.actor_optimizers:
+            return
+
+        actor_opt = self.actor_optimizers[group]
+
+        # --------------------------------------------------------
         # Logging
-        if group in self.actor_optimizers:
-            actor_opt = self.actor_optimizers[group]
-            log_interval = getattr(algo_cfg, "pc_log_interval", 0)
-            if log_interval > 0 and exp.n_iters_performed % log_interval == 0 and actor_opt.last_stats:
-                stats = {
-                    f"train/pc/{group}/{k}": v
+        # --------------------------------------------------------
+        log_interval = getattr(exp.algorithm_config, "pc_log_interval", 0)
+
+        if log_interval > 0 and exp.n_iters_performed % log_interval == 0:
+            exp.logger.log(
+                {
+                    f"train/pc_vi/{group}/{k}": v
                     for k, v in actor_opt.last_stats.items()
-                }
-                exp.logger.log(stats, step=exp.n_iters_performed)
+                },
+                step=exp.n_iters_performed,
+            )
 
 
 # ============================================================
-# Algorithm & Config
+# Algorithm
 # ============================================================
 
 class IppoPCVI(IppoVI):
+
     def __init__(
         self,
-        extra_betas=(0.9, 0.999),
-        pc_beta=1.0,
-        pc_theta=0.95,
-        pc_gamma=0.0,
-        grad_clip=10.0,
-        pc_lambda_min=1e-6,
-        pc_lambda_max=5e-4,
-        pc_lambda_growth=2.0,
-        pc_lambda_rho=1e-4,
-        pc_beta_min=0.0,
-        pc_beta_max=1.0,
-        pc_log_interval=0,
+
+        # Adam
+        extra_betas: Tuple[float, float] = (0.9, 0.999),
+
+        # Projection-Contraction
+        pc_beta: float = 1.0,
+        pc_theta: float = 0.95,
+
+        pc_lambda_min: float = 1e-6,
+        pc_lambda_max: float = 1e-3,
+
+        pc_beta_min: float = 0.3,
+        pc_beta_max: float = 1.0,
+
+        grad_clip: float = 10.0,
+
+        # Critic (plain Adam, separate from VI)
+        critic_lr: float = 1e-3,
+
+        pc_log_interval: int = 0,
+
         **kwargs,
     ):
         super().__init__(**kwargs)
+
         self.extra_betas = extra_betas
+
         self.pc_beta = pc_beta
         self.pc_theta = pc_theta
-        self.pc_gamma = pc_gamma
-        self.grad_clip = grad_clip
+
         self.pc_lambda_min = pc_lambda_min
         self.pc_lambda_max = pc_lambda_max
-        self.pc_lambda_growth = pc_lambda_growth
-        self.pc_lambda_rho = pc_lambda_rho
+
         self.pc_beta_min = pc_beta_min
         self.pc_beta_max = pc_beta_max
+
+        self.grad_clip = grad_clip
+        self.critic_lr = critic_lr
+
         self.pc_log_interval = pc_log_interval
 
 
+# ============================================================
+# Config
+# ============================================================
+
 @dataclass
 class IppoPCVIConfig(IppoVIConfig):
-    extra_betas: Tuple[float, float] = (0.9, 0.999)
+
+    extra_betas: tuple = (0.9, 0.999)
+
     pc_beta: float = 1.0
     pc_theta: float = 0.95
-    pc_gamma: float = 0.0
-    grad_clip: float = 10.0
+
     pc_lambda_min: float = 1e-6
-    pc_lambda_max: float = 5e-4
-    pc_lambda_growth: float = 2.0
-    pc_lambda_rho: float = 1e-4
-    pc_beta_min: float = 0.0
+    pc_lambda_max: float = 1e-3
+
+    pc_beta_min: float = 0.3
     pc_beta_max: float = 1.0
+
+    grad_clip: float = 10.0
+
+    # Critic uses a plain Adam with its own (typically higher) lr
+    critic_lr: float = 1e-3
+
     pc_log_interval: int = 0
 
     @staticmethod
     def associated_class():
         return IppoPCVI
-
-
-PCExtraGradientAdam = PCOptimizer
