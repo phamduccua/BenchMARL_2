@@ -137,7 +137,7 @@ usage() {
     echo "          ippo_extragradient | ippo_extragradient_self_adaptive"
     echo "          ippo_extragradient_self_adaptive_nu05"
     echo "          ippo_extragradient_self_adaptive_ms001 | ippo_extragradient_self_adaptive_ms05"
-    echo "          ippo_projection_contraction"
+    echo "          ippo_projection_contraction | ippo_projection_contraction_alg2"
     echo ""
     echo "Ví dụ:"
     echo "  $0 both ippo mappo ippo_vi"
@@ -206,6 +206,10 @@ for algo in "$@"; do
                 ;;
             ippo_projection_contraction)
                 run_algo "ippo_projection_contraction" "$task_path" "${prefix}_ippo_projection_contraction"
+                ;;
+            ippo_projection_contraction_alg2)
+                run_algo "ippo_projection_contraction" "$task_path" "${prefix}_ippo_projection_contraction_alg2" \
+                    "algorithm.viscosity_mode=alg2"
                 ;;
             *)
                 run_algo "$algo" "$task_path" "${prefix}_${algo}"

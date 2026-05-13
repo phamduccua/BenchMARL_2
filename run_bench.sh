@@ -109,7 +109,7 @@ run_algo() {
 
 if [ $# -eq 0 ]; then
     echo "Cách dùng: $0 <algo1> [algo2] ..."
-    echo "Ví dụ:    $0 ippo_vi ippo mappo ippo_projection_contraction"
+    echo "Ví dụ:    $0 ippo_vi ippo mappo ippo_projection_contraction ippo_projection_contraction_alg2"
     exit 1
 fi
 
@@ -141,6 +141,10 @@ for algo in "$@"; do
             ;;
         ippo_projection_contraction)
             run_algo "ippo_projection_contraction" "ippo_projection_contraction"
+            ;;
+        ippo_projection_contraction_alg2)
+            run_algo "ippo_projection_contraction" "ippo_projection_contraction_alg2" \
+                "algorithm.viscosity_mode=alg2"
             ;;
         *)
             run_algo "$algo" "$algo"
