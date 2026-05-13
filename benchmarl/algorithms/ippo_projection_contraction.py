@@ -367,7 +367,8 @@ class ProjectionContractionCallback(Callback):
         # Logging
         if group in self.actor_optimizers:
             actor_opt = self.actor_optimizers[group]
-            if exp.n_iters_performed % 100 == 0 and actor_opt.last_stats:
+            log_interval = getattr(algo_cfg, "pc_log_interval", 0)
+            if log_interval > 0 and exp.n_iters_performed % log_interval == 0 and actor_opt.last_stats:
                 stats = {
                     f"train/pc/{group}/{k}": v
                     for k, v in actor_opt.last_stats.items()
@@ -422,6 +423,7 @@ class IppoPCVIConfig(IppoVIConfig):
     pc_lambda_max: float = 1.0
     pc_beta_min: float = 1e-4
     pc_beta_max: float = 2.0
+    pc_log_interval: int = 0
 
     @staticmethod
     def associated_class():
